@@ -10,10 +10,113 @@
 import random
 import math
 import logging
-
+import os
+import glob
+import torch
+import numpy as np
+from stable_baselines3.common.callbacks import BaseCallback
+from pathlib import Path
+import chess
 
 logger = logging.getLogger(__name__)  # ✅ Ensure logging is available
 
+def flip_fen(fen):
+    """
+    Flips a FEN string to swap white and black perspectives.
+
+    :param fen: (str) The FEN string to flip.
+    :return: (str) The flipped FEN.
+    """
+    board = chess.Board(fen)
+
+    # Flip the board perspective
+    board = board.mirror()
+
+    # Swap turn indicator
+    parts = fen.split(" ")
+    parts[1] = "w" if parts[1] == "b" else "b"
+
+    # Update the castling rights (flip king and queen side)
+    castling = parts[2]
+    flipped_castling = castling.translate(str.maketrans("KQkq", "kqKQ"))
+    parts[2] = flipped_castling
+
+    # Keep everything else the same but with a flipped board
+    return board.fen()
+
+def uci_to_action_index(uci_move, env):
+    """
+    Converts a UCI move (e.g., 'e2e4') to an action index used by gym-chess.
+
+    :param uci_move: (str) The move in UCI notation.
+    :param env: (gym.Env) The gym chess environment.
+    :return: (int) The corresponding action index.
+    """
+    move_list = list(env.legal_moves)
+    if uci_move in move_list:
+        return move_list.index(uci_move)
+    return None  # Invalid move
+
+def action_index_to_uci(action_index, env):
+    """
+    Converts an action index to a UCI move string.
+
+    :param action_index: (int) The action index from the agent.
+    :param env: (gym.Env) The gym chess environment.
+    :return: (str) The corresponding UCI move.
+    """
+    move_list = list(env.legal_moves)
+    if 0 <= action_index < len(move_list):
+        return move_list[action_index]
+    return None  # Invalid action
+
+# Linear scheduler for RL agent parameters
+def linear_schedule(initial_value, final_value=0.0):
+    """
+    Linear learning rate schedule.
+    :param initial_value: (float or str)
+    :return: (function)
+    """
+    if isinstance(initial_value, str):
+        initial_value = float(initial_value)
+        final_value = float(final_value)
+        assert (initial_value > 0.0), "linear_schedule work only with positive decreasing values"
+
+    def func(progress):
+        """
+        Progress will decrease from 1 (beginning) to 0
+        :param progress: (float)
+        :return: (float)
+        """
+        return final_value + progress * (initial_value - final_value)
+
+    return func
+
+# AutoSave Callback
+class AutoSave(BaseCallback):
+    """
+    Callback for saving a model, it is saved every ``check_freq`` steps
+
+    :param check_freq: (int)
+    :param save_path: (str) Path to the folder where the model will be saved.
+    :filename_prefix: (str) Filename prefix
+    :param verbose: (int)
+    """
+    def __init__(self, check_freq: int, num_envs: int, save_path: str, filename_prefix: str="", verbose: int=1):
+        super(AutoSave, self).__init__(verbose)
+        self.check_freq = int(check_freq / num_envs)
+        self.num_envs = num_envs
+        self.save_path_base = Path(save_path)
+        self.filename = filename_prefix + "autosave_"
+
+    def _on_step(self) -> bool:
+        if self.n_calls % self.check_freq == 0:
+            if self.verbose > 0:
+                print("Saving latest model to {}".format(self.save_path_base))
+            # Save the agent
+            self.model.save(self.save_path_base / (self.filename + str(self.n_calls * self.num_envs)))
+
+        return True
 
 def dynamic_skill_level():
     """Dynamically selects a skill level based on weighted probability."""
@@ -98,3 +201,34 @@ def evaluate_turn(board, main_color, eval_before, eval_after, stockfish_engine):
             reward += (win_prob - loss_prob) * 2
 
     return reward, None  # ✅ Return move reward, but no final reward yet
+
+
+def load_trajectories(npz_dir, pt_dir, device):
+    """Loads expert trajectories from either .npz (CPU) or .pt (GPU) files dynamically."""
+    if device.type == "cuda" and any(f.endswith(".pt") for f in os.listdir(pt_dir)):
+        logger.info("🔄 Loading expert trajectories from .pt files (GPU mode)")
+        files = glob.glob(os.path.join(pt_dir, "*.pt"))
+        load_func = torch.load
+    else:
+        logger.info("🖥️ Loading expert trajectories from .npz files (CPU mode)")
+        files = glob.glob(os.path.join(npz_dir, "*.npz"))
+        load_func = np.load
+
+    if not files:
+        logger.error("🚨 No trajectory files found!")
+        return None
+
+    obs_list, actions_list = [], []
+    for file in files:
+        try:
+            data = load_func(file)
+            obs_list.append(torch.tensor(data["obs"], dtype=torch.float32) if device.type == "cuda" else data["obs"])
+            actions_list.append(torch.tensor(data["actions"], dtype=torch.int64) if device.type == "cuda" else data["actions"])
+        except Exception as e:
+            logger.warning(f"⚠️ Skipping {file} due to error: {e}")
+
+    obs_array = torch.cat(obs_list, dim=0) if device.type == "cuda" else np.concatenate(obs_list, axis=0)
+    actions_array = torch.cat(actions_list, dim=0) if device.type == "cuda" else np.concatenate(actions_list, axis=0)
+
+    logger.info(f"📊 Loaded {obs_array.shape[0]} expert moves from {len(files)} files")
+    return obs_array, actions_array
