@@ -1,0 +1,9 @@
+*.npz
+*.log
+*.rtbz
+*.rtbw
+*.md5
+venv/*
+win_venv/*
+*.pyc
+*.csv
